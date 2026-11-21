@@ -38,7 +38,7 @@ static constexpr i64 LATE_MS = 86400000ll;
 static constexpr i64 SEVEN = 7 * DAY_MS;
 static constexpr i64 GAP = 1800000ll;
 static constexpr u8 PROD_EMPTY = 0x80;
-static const size_t NB = 128;
+static const size_t NB = 256;
 
 static std::string data_dir = "/data";
 static std::string out_dir = "/output";
@@ -1023,6 +1023,8 @@ static void parse_links(const u8 *data, size_t len, UserTable &users,
                         std::vector<u8> &user_arena,
                         std::vector<Rec3> &name_rec,
                         std::vector<u32> &pairs) {
+    // links files are small; keep the scalar byte-walk splitter but avoid
+    // re-scanning via memchr+split double passes: single memchr pass is fine
     size_t start = 0;
     bool first = true;
     while (start < len) {
