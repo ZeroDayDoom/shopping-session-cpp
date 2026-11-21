@@ -43,6 +43,7 @@ static const size_t NB = 256;
 static std::string data_dir = "/data";
 static std::string out_dir = "/output";
 static unsigned NTHREADS = 8;
+static u32 g_unknown_rank = 0;
 
 static std::chrono::steady_clock::time_point T0;
 static void logstage(const char *s) {
@@ -249,13 +250,14 @@ static inline i64 parse_ts(const u8 *b, size_t n) {
 }
 
 static inline bool parse_price(const u8 *b, size_t n, i64 &out) {
-    if (n == 0 || n > 8) return false;
+    if (n == 0) return false;
     i64 v = 0;
     for (size_t i = 0; i < n; i++) {
         if (b[i] < '0' || b[i] > '9') return false;
         v = v * 10 + (b[i] - '0');
+        if (v > 10000000) return false; // early exit: also bounds overflow
     }
-    if (v < 1 || v > 10000000) return false;
+    if (v < 1) return false;
     out = v;
     return true;
 }
@@ -667,7 +669,7 @@ static void parse_event_chunk(const u8 *data, size_t lo, size_t hi,
     }
     const size_t bmask = NB - 1;
 
-    size_t fi = 0, fs = 0;
+    size_t fi = 0, fs = lo;
     bool quoted = false, bad = false;
     size_t f[7][2];
     size_t line_start = lo;
@@ -890,7 +892,7 @@ static void parse_click_chunk(const u8 *data, size_t lo, size_t hi, u32 seq,
     }
     const size_t bmask = NB - 1;
 
-    size_t fi = 0, fs = 0;
+    size_t fi = 0, fs = lo;
     bool quoted = false, bad = false;
     size_t f[4][2];
     size_t line_start = lo;
@@ -2112,9 +2114,15 @@ int main() {
                       int c = memcmp(x.data(), y.data(), mn);
                       return c != 0 ? c < 0 : x.size() < y.size();
                   });
-        // unknown products rank after every known category; the output value
-        // is the literal string "unknown" (E9/E19)
+        // unknown products: 'unknown' competes byte-wise like any category
+        // (rules: a tie in top_category goes to the byte-wise smallest)
         categories.push_back(BoxStr{'u', 'n', 'k', 'n', 'o', 'w', 'n'});
+        std::sort(categories.begin(), categories.end(),
+                  [](const BoxStr &x, const BoxStr &y) {
+                      size_t mn = std::min(x.size(), y.size());
+                      int c = memcmp(x.data(), y.data(), mn);
+                      return c != 0 ? c < 0 : x.size() < y.size();
+                  });
         std::unordered_map<std::string, u32> sorted_rank;
         for (size_t k = 0; k < categories.size(); k++)
             sorted_rank[std::string(categories[k].begin(),
@@ -2134,8 +2142,10 @@ int main() {
             pv.push_back(sorted_rank[cn]);
         }
         known_products.build(pk1, pk2, pv);
+        u32 unk = sorted_rank["unknown"]; // 'unknown' sorted byte-wise in
+        g_unknown_rank = unk;
     }
-    u32 unknown_rank = (u32)categories.size() - 1; // 'unknown' appended last
+    u32 unknown_rank = g_unknown_rank;
     logstage("products");
 
     // ---- users
@@ -2175,29 +2185,35 @@ int main() {
     // ---- events
     std::vector<FileBuf> ebufs;
     read_all_files(data_dir + "/events", ebufs);
-    size_t n_echunks = ebufs.size();
+    // One task per 32MB line-aligned chunk: each chunk gets its OWN bucket
+    // vectors (a file's later chunks must not wipe earlier ones).
+    struct ETask { u32 file; size_t off, end; };
+    std::vector<ETask> etasks;
+    for (size_t i = 0; i < ebufs.size(); i++) {
+        size_t len = ebufs[i].real_len, off = 0;
+        while (off < len) {
+            size_t end = std::min(len, off + (size_t)(32 << 20));
+            if (end < len) {
+                const u8 *nl = (const u8 *)memchr(
+                    ebufs[i].data.data() + end, '\n', len - end);
+                if (nl) end = (size_t)(nl - ebufs[i].data.data()) + 1;
+                else end = len;
+            }
+            etasks.push_back(ETask{(u32)i, off, end});
+            off = end;
+        }
+    }
+    size_t n_echunks = etasks.size();
     std::vector< std::vector<u64> > esides(n_echunks);
     std::vector< std::vector< std::vector<ERec> > > ebuckets(n_echunks);
     std::vector< std::vector<u8> > ev_arenas(n_echunks);
     std::vector< std::vector<Rec3> > ev_name_recs(n_echunks);
     parallel_for(n_echunks, 1, [&](size_t a, size_t b) {
-        for (size_t i = a; i < b; i++) {
-            if (ebufs[i].data.empty()) continue;
-            size_t len = ebufs[i].real_len;
-            size_t off = 0;
-            while (off < len) {
-                size_t end = std::min(len, off + (size_t)(32 << 20));
-                if (end < len) {
-                    const u8 *nl = (const u8 *)memchr(
-                        ebufs[i].data.data() + end, '\n', len - end);
-                    if (nl) end = (size_t)(nl - ebufs[i].data.data()) + 1;
-                    else end = len;
-                }
-                parse_event_chunk(ebufs[i].data.data(), off, end, users,
-                                  ev_arenas[i], ev_name_recs[i], esides[i],
-                                  ebuckets[i]);
-                off = end;
-            }
+        for (size_t t = a; t < b; t++) {
+            const ETask &tk = etasks[t];
+            parse_event_chunk(ebufs[tk.file].data.data(), tk.off, tk.end,
+                              users, ev_arenas[t], ev_name_recs[t],
+                              esides[t], ebuckets[t]);
         }
     });
     logstage("events parsed");
@@ -2205,16 +2221,32 @@ int main() {
     // ---- clicks
     std::vector<FileBuf> cbufs;
     read_all_files(data_dir + "/clicks", cbufs);
-    size_t n_cchunks = cbufs.size();
+    struct CTask { u32 file; size_t off, end; };
+    std::vector<CTask> ctasks;
+    for (size_t i = 0; i < cbufs.size(); i++) {
+        size_t len = cbufs[i].real_len, off = 0;
+        while (off < len) {
+            size_t end = std::min(len, off + (size_t)(32 << 20));
+            if (end < len) {
+                const u8 *nl = (const u8 *)memchr(
+                    cbufs[i].data.data() + end, '\n', len - end);
+                if (nl) end = (size_t)(nl - cbufs[i].data.data()) + 1;
+                else end = len;
+            }
+            ctasks.push_back(CTask{(u32)i, off, end});
+            off = end;
+        }
+    }
+    size_t n_cchunks = ctasks.size();
     std::vector< std::vector< std::vector<CRec> > > cbuckets(n_cchunks);
     std::vector< std::vector<u8> > cl_arenas(n_cchunks);
     std::vector< std::vector<Rec3> > cl_name_recs(n_cchunks);
     parallel_for(n_cchunks, 1, [&](size_t a, size_t b) {
-        for (size_t i = a; i < b; i++) {
-            if (cbufs[i].data.empty()) continue;
-            parse_click_chunk(cbufs[i].data.data(), 0, cbufs[i].real_len,
-                              (u32)i, known_campaigns, users, cl_arenas[i],
-                              cl_name_recs[i], cl_arenas[i], cbuckets[i]);
+        for (size_t t = a; t < b; t++) {
+            const CTask &tk = ctasks[t];
+            parse_click_chunk(cbufs[tk.file].data.data(), tk.off, tk.end,
+                              (u32)t, known_campaigns, users, cl_arenas[t],
+                              cl_name_recs[t], cl_arenas[t], cbuckets[t]);
         }
     });
     logstage("clicks parsed");
