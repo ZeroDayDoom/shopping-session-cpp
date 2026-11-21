@@ -1285,86 +1285,56 @@ struct Agg {
     }
 };
 
+// One root's sessions and that root's clicks; hoisted scratch buffers.
 static void attribute_group(Sess *sessions, size_t ns, const CFin *clicks,
                             size_t c_lo, size_t c_hi, u16 organic,
-                            size_t ncamp1, size_t ndays, i32 ws_day, Agg &agg) {
-    std::vector< std::pair<u32, size_t> > s_ranges;
-    for (size_t i = 0; i < ns; i++) {
-        if (s_ranges.empty() || s_ranges.back().first != sessions[i].root)
-            s_ranges.emplace_back(sessions[i].root, i);
-    }
-    std::vector< std::pair<u32, size_t> > c_ranges;
-    for (size_t i = c_lo; i < c_hi; i++) {
-        if (c_ranges.empty() || c_ranges.back().first != clicks[i].root)
-            c_ranges.emplace_back(clicks[i].root, i);
-    }
-
-    std::vector<u32> counts(ncamp1, 0);
-    std::vector<u8> in_active(ncamp1, 0);
-    std::vector<u32> seen_gen(ncamp1, UINT32_MAX);
-    std::vector<u16> active;
-
-    size_t i = 0, j = 0;
-    while (i < s_ranges.size() && j < c_ranges.size()) {
-        u32 sr = s_ranges[i].first;
-        size_t ss = s_ranges[i].second;
-        size_t se = (i + 1 < s_ranges.size()) ? s_ranges[i + 1].second : ns;
-        u32 cr = c_ranges[j].first;
-        size_t cs = c_ranges[j].second;
-        size_t ce = (j + 1 < c_ranges.size()) ? c_ranges[j + 1].second : c_hi;
-        if (sr < cr) { i++; continue; }
-        if (cr < sr) { j++; continue; }
-
-        size_t l = cs;
-        i64 r_in = (i64)cs - 1;
-        for (size_t si = ss; si < se; si++) {
-            Sess &s = sessions[si];
-            i64 lo = s.start - SEVEN;
-            while (r_in + 1 < (i64)ce &&
-                   clicks[(size_t)(r_in + 1)].ts <= s.start) {
-                r_in++;
-                u32 c = clicks[(size_t)r_in].camp;
-                if (counts[c] == 0 && !in_active[c]) {
-                    active.push_back((u16)c);
-                    in_active[c] = 1;
-                }
-                counts[c]++;
+                            size_t ncamp1, size_t ndays, i32 ws_day,
+                            u32 tag_base, Agg &agg,
+                            std::vector<u32> &counts,
+                            std::vector<u8> &in_active,
+                            std::vector<u32> &seen_gen,
+                            std::vector<u16> &active) {
+    size_t l = c_lo;
+    i64 r_in = (i64)c_lo - 1;
+    for (size_t si = 0; si < ns; si++) {
+        Sess &s = sessions[si];
+        i64 lo = s.start - SEVEN;
+        while (r_in + 1 < (i64)c_hi &&
+               clicks[(size_t)(r_in + 1)].ts <= s.start) {
+            r_in++;
+            u32 c = clicks[(size_t)r_in].camp;
+            if (counts[c] == 0 && !in_active[c]) {
+                active.push_back((u16)c);
+                in_active[c] = 1;
             }
-            while ((i64)l <= r_in && clicks[l].ts < lo) {
-                u32 c = clicks[l].camp;
-                counts[c]--;
-                if (counts[c] == 0) in_active[c] = 0;
-                l++;
-            }
-            u16 credited = organic;
-            if (r_in >= (i64)l && (size_t)r_in < ce &&
-                clicks[(size_t)r_in].ts >= lo)
-                credited = clicks[(size_t)r_in].camp;
-            s.camp = credited;
-            if (active.size() > 32)
-                active.erase(std::remove_if(active.begin(), active.end(),
-                                            [&](u16 c) {
-                                                return counts[c] == 0 ||
-                                                       !in_active[c];
-                                            }),
-                             active.end());
-            size_t d = (size_t)(s.day - ws_day);
-            u32 tag = (u32)si;
-            for (u16 c16 : active) {
-                u32 c = c16;
-                if (seen_gen[c] == tag) continue;
-                seen_gen[c] = tag;
-                if (counts[c] > 0 && in_active[c]) agg.assi[c * ndays + d] += 1;
-            }
+            counts[c]++;
         }
-        for (size_t k = cs; k < ce; k++) {
-            u32 c = clicks[k].camp;
-            counts[c] = 0;
-            in_active[c] = 0;
+        while ((i64)l <= r_in && clicks[l].ts < lo) {
+            u32 c = clicks[l].camp;
+            counts[c]--;
+            if (counts[c] == 0) in_active[c] = 0;
+            l++;
         }
-        active.clear();
-        i++;
-        j++;
+        u16 credited = organic;
+        if (r_in >= (i64)l && (size_t)r_in < c_hi &&
+            clicks[(size_t)r_in].ts >= lo)
+            credited = clicks[(size_t)r_in].camp;
+        s.camp = credited;
+        if (active.size() > 32)
+            active.erase(std::remove_if(active.begin(), active.end(),
+                                        [&](u16 c) {
+                                            return counts[c] == 0 ||
+                                                   !in_active[c];
+                                        }),
+                         active.end());
+        size_t d = (size_t)(s.day - ws_day);
+        u32 tag = tag_base + (u32)si;
+        for (u16 c16 : active) {
+            u32 c = c16;
+            if (seen_gen[c] == tag) continue;
+            seen_gen[c] = tag;
+            if (counts[c] > 0 && in_active[c]) agg.assi[c * ndays + d] += 1;
+        }
     }
 
     for (size_t si = 0; si < ns; si++) {
@@ -1377,6 +1347,13 @@ static void attribute_group(Sess *sessions, size_t ns, const CFin *clicks,
             agg.rev[base] += s.revenue;
         }
     }
+    // reset scratch for the next span
+    for (size_t k = c_lo; k < c_hi; k++) {
+        u32 c = clicks[k].camp;
+        counts[c] = 0;
+        in_active[c] = 0;
+    }
+    active.clear();
 }
 
 // Parallel LSD radix sort keyed by a precomputed 64-bit key array
@@ -2506,6 +2483,10 @@ int main() {
     parallel_for(tbounds.size() - 1, 1, [&](size_t a, size_t b) {
         for (size_t t = a; t < b; t++) {
             Agg &tagg = aggs[t];
+            std::vector<u32> counts(ncamp1, 0);
+            std::vector<u8> in_active(ncamp1, 0);
+            std::vector<u32> seen_gen(ncamp1, UINT32_MAX);
+            std::vector<u16> active;
             for (size_t g = tbounds[t]; g < tbounds[t + 1]; g++) {
                 size_t slo = sess_spans[g].first, shi = sess_spans[g].second;
                 u32 root = sessions[slo].root;
@@ -2524,7 +2505,8 @@ int main() {
                 }
                 attribute_group(sessions.data() + slo, shi - slo, clicks.data(),
                                 c_lo, c_hi, organic, ncamp1, ndays, ws_day,
-                                tagg);
+                                (u32)slo, tagg, counts, in_active, seen_gen,
+                                active);
             }
         }
     });
