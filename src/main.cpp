@@ -2259,21 +2259,29 @@ int main() {
             name_by_gid[rc.gid].assign(user_arena.begin() + rc.off,
                                        user_arena.begin() + rc.off + rc.len);
     }
-    for (size_t ci = 0; ci < n_echunks; ci++) {
-        for (auto &rc : ev_name_recs[ci]) {
-            if (name_by_gid[rc.gid].empty())
-                name_by_gid[rc.gid].assign(ev_arenas[ci].begin() + rc.off,
-                                           ev_arenas[ci].begin() + rc.off +
-                                               rc.len);
-        }
-    }
-    for (size_t ci = 0; ci < n_cchunks; ci++) {
-        for (auto &rc : cl_name_recs[ci]) {
-            if (name_by_gid[rc.gid].empty())
-                name_by_gid[rc.gid].assign(cl_arenas[ci].begin() + rc.off,
-                                           cl_arenas[ci].begin() + rc.off +
-                                               rc.len);
-        }
+    // event-chunk and click-chunk name records are disjoint per gid (is_new
+    // guarantees a single recorder), so the two loops parallelize safely
+    {
+        std::vector<size_t> eq(n_echunks), cq(n_cchunks);
+        for (size_t ci = 0; ci < n_echunks; ci++) eq[ci] = ci;
+        for (size_t ci = 0; ci < n_cchunks; ci++) cq[ci] = ci;
+        auto fill = [&](std::vector<BoxStr> &arenas,
+                        std::vector< std::vector<Rec3> > &recs,
+                        std::vector<size_t> &idx) {
+            parallel_for(idx.size(), 1, [&](size_t a, size_t b) {
+                for (size_t t = a; t < b; t++) {
+                    size_t ci = idx[t];
+                    for (auto &rc : recs[ci]) {
+                        if (name_by_gid[rc.gid].empty())
+                            name_by_gid[rc.gid].assign(
+                                arenas[ci].begin() + rc.off,
+                                arenas[ci].begin() + rc.off + rc.len);
+                    }
+                }
+            });
+        };
+        fill(ev_arenas, ev_name_recs, eq);
+        fill(cl_arenas, cl_name_recs, cq);
     }
     logstage("names reconciled");
 
